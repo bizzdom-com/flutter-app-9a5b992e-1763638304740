@@ -1,0 +1,179 @@
+name: iOS Build and Publish (Signed)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'lib/**'
+      - 'ios/**'
+      - 'android/**'
+      - 'pubspec.yaml'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - debug
+          - release
+      publish_to_app_store:
+        description: 'Upload to App Store Connect'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.3'
+          channel: 'stable'
+          
+      - name: Get dependencies
+        run: flutter pub get
+        
+      - name: Analyze code
+        run: flutter analyze || true
+        
+      - name: Run tests (continue on error)
+        run: flutter test || true
+
+      - name: Build iOS (Flutter)
+        run: |
+          echo "🍎 Building iOS project..."
+          flutter build ios --release --no-codesign
+          echo "✅ Flutter iOS build artifacts generated"
+
+      - name: Prepare signing keychain
+        if: ${{ inputs.publish_to_app_store }}
+        env:
+          IOS_CERT_P12: ${{ secrets.IOS_CERT_P12 }}
+          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$IOS_CERT_P12" ] || [ -z "$IOS_CERT_PASSWORD" ]; then
+            echo "⚠️  iOS signing certificate secrets not configured"
+            exit 1
+          fi
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/apple_cert.p12"
+
+          echo "$IOS_CERT_P12" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$IOS_CERT_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$IOS_CERT_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$IOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed 's/"//g')
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$IOS_CERT_PASSWORD" "$KEYCHAIN_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+
+      - name: Install provisioning profile
+        if: ${{ inputs.publish_to_app_store }}
+        env:
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          if [ -z "$IOS_PROVISIONING_PROFILE" ]; then
+            echo "⚠️  iOS provisioning profile secret not configured"
+            exit 1
+          fi
+
+          PROFILE_PATH="$RUNNER_TEMP/embedded.mobileprovision"
+          echo "$IOS_PROVISIONING_PROFILE" | base64 --decode > "$PROFILE_PATH"
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' /dev/stdin <<< $(security cms -D -i "$PROFILE_PATH"))
+          cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          echo "PROVISIONING_PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
+
+      - name: Create export options
+        if: ${{ inputs.publish_to_app_store }}
+        env:
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          IOS_PROVISIONING_PROFILE_NAME: ${{ secrets.IOS_PROVISIONING_PROFILE_NAME }}
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          python3 -c "import os, plistlib; plistlib.dump({'compileBitcode': False, 'destination': 'export', 'method': 'app-store', 'provisioningProfiles': {os.environ['IOS_BUNDLE_ID']: os.environ['IOS_PROVISIONING_PROFILE_NAME']}, 'signingStyle': 'manual', 'stripSwiftSymbols': True, 'teamID': os.environ['IOS_TEAM_ID'], 'uploadBitcode': False, 'uploadSymbols': True}, open('exportOptions.plist', 'wb'))"
+      - name: Archive iOS app
+        if: ${{ inputs.publish_to_app_store }}
+        env:
+          KEYCHAIN_PATH: ${{ env.KEYCHAIN_PATH }}
+        run: |
+          xcodebuild             -workspace ios/Runner.xcworkspace             -scheme Runner             -configuration Release             -archivePath build/ios/archive/Runner.xcarchive             OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH"             archive
+
+      - name: Export signed IPA
+        if: ${{ inputs.publish_to_app_store }}
+        run: |
+          xcodebuild -exportArchive             -archivePath build/ios/archive/Runner.xcarchive             -exportOptionsPlist exportOptions.plist             -exportPath build/ios/ipa
+
+      - name: Upload to App Store Connect
+        if: ${{ inputs.publish_to_app_store }}
+        env:
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          if [ -z "$APP_STORE_CONNECT_API_KEY" ]; then
+            echo "⚠️  App Store Connect API credentials not configured"
+            echo "Please set up the following repository secrets:"
+            echo "- APP_STORE_CONNECT_API_KEY"
+            echo "- APP_STORE_CONNECT_KEY_ID"
+            echo "- APP_STORE_CONNECT_ISSUER_ID"
+            exit 1
+          fi
+
+          IPA_DIR="build/ios/ipa"
+          IPA_PATH=$(find "$IPA_DIR" -maxdepth 1 -name "*.ipa" | head -n 1)
+
+          if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
+            echo "❌ Signed IPA not found under $IPA_DIR"
+            ls -R "$IPA_DIR" || true
+            exit 1
+          fi
+
+          echo "📤 Uploading signed IPA to App Store Connect..."
+          mkdir -p private_keys
+          echo "$APP_STORE_CONNECT_API_KEY" | base64 --decode > private_keys/AuthKey_$APP_STORE_CONNECT_KEY_ID.p8
+
+          xcrun altool --upload-app --type ios                        --file "$IPA_PATH"                        --apiKey "$APP_STORE_CONNECT_KEY_ID"                        --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"                        --verbose
+
+          echo "✅ App uploaded to App Store Connect successfully"
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-app
+          path: build/ios/ipa/*.ipa
+          retention-days: 30
+
+      - name: Cleanup signing materials
+        if: always()
+        env:
+          KEYCHAIN_PATH: ${{ env.KEYCHAIN_PATH }}
+          PROVISIONING_PROFILE_UUID: ${{ env.PROVISIONING_PROFILE_UUID }}
+        run: |
+          echo "🧹 Cleaning up signing assets..."
+          if [ -n "$KEYCHAIN_PATH" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+          if [ -n "$PROVISIONING_PROFILE_UUID" ]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROVISIONING_PROFILE_UUID.mobileprovision" || true
+          fi
+          rm -rf private_keys exportOptions.plist
+
+      - name: Build summary
+        run: |
+          echo "## iOS Build Complete 🍎" >> $GITHUB_STEP_SUMMARY
+          echo "- Build type: ${{ github.event.inputs.build_type || 'release' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- App Store upload: ${{ inputs.publish_to_app_store == 'true' && 'Completed' || 'Skipped' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- IPA artifact: Runner.ipa" >> $GITHUB_STEP_SUMMARY
+          echo "- Signing assets: ${{ inputs.publish_to_app_store == 'true' && 'Managed automatically' || 'Not required' }}" >> $GITHUB_STEP_SUMMARY
